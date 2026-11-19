@@ -45,6 +45,8 @@ if errorlevel 1 (
     exit /b 1
 )
 
+powershell -NoProfile -ExecutionPolicy Bypass -Command "Unblock-File -Path '%INSTALL_DIR%\*' -ErrorAction SilentlyContinue" >nul 2>&1
+
 for /f "delims=" %%v in ('"%SNAP_DST%" --version 2^>nul') do set "CUR_VER=%%v"
 if not "%CUR_VER%"=="" (
     echo %CUR_VER%> "%INSTALL_DIR%\installed_version.txt"
