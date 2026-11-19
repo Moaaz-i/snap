@@ -149,6 +149,10 @@ final class DriveClient {
     private let authFileURL: URL
     private var accessToken: String = ""
     private var accessTokenExpiry: Date = .distantPast
+    private let dayLock = NSLock()
+    private var cachedParentId: String = ""
+    private var cachedDayName: String = ""
+    private var cachedDayId: String = ""
 
     init(auth: AuthData, authFileURL: URL) {
         self.auth = auth
@@ -410,15 +414,113 @@ final class DriveClient {
         return false
     }
 
+    private func extractDayName(from filename: String) -> String {
+        if filename.count >= 10 {
+            let prefix = String(filename.prefix(10))
+            let chars = Array(prefix)
+            if chars[4] == "-" && chars[7] == "-" && chars[0].isNumber {
+                return prefix
+            }
+        }
+        let df = DateFormatter()
+        df.locale = Locale(identifier: "en_US_POSIX")
+        df.dateFormat = "yyyy-MM-dd"
+        return df.string(from: Date())
+    }
+
+    private func ensureDaySubfolder(parentId: String, dayName: String) -> String? {
+        guard !parentId.isEmpty, !dayName.isEmpty else { return nil }
+        dayLock.lock()
+        defer { dayLock.unlock() }
+
+        if parentId == cachedParentId && dayName == cachedDayName && !cachedDayId.isEmpty {
+            return cachedDayId
+        }
+
+        let query = "name='\(dayName)' and '\(parentId)' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false"
+        var searchComps = URLComponents(string: "https://www.googleapis.com/drive/v3/files")!
+        searchComps.queryItems = [
+            URLQueryItem(name: "q", value: query),
+            URLQueryItem(name: "fields", value: "files(id,name)"),
+            URLQueryItem(name: "pageSize", value: "1"),
+        ]
+        if let searchURL = searchComps.url {
+            var req = URLRequest(url: searchURL)
+            req.httpMethod = "GET"
+            req.timeoutInterval = 15
+            req.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
+            let sem = DispatchSemaphore(value: 0)
+            var foundId: String?
+            URLSession.shared.dataTask(with: req) { data, resp, _ in
+                if let http = resp as? HTTPURLResponse, http.statusCode == 200,
+                   let data = data,
+                   let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                   let files = json["files"] as? [[String: Any]],
+                   let firstId = files.first?["id"] as? String, !firstId.isEmpty {
+                    foundId = firstId
+                }
+                sem.signal()
+            }.resume()
+            sem.wait()
+
+            if let id = foundId {
+                cachedParentId = parentId
+                cachedDayName = dayName
+                cachedDayId = id
+                return id
+            }
+        }
+
+        let createURL = URL(string: "https://www.googleapis.com/drive/v3/files")!
+        var createReq = URLRequest(url: createURL)
+        createReq.httpMethod = "POST"
+        createReq.timeoutInterval = 15
+        createReq.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
+        createReq.setValue("application/json; charset=UTF-8", forHTTPHeaderField: "Content-Type")
+        let createPayload: [String: Any] = [
+            "name": dayName,
+            "mimeType": "application/vnd.google-apps.folder",
+            "parents": [parentId],
+        ]
+        createReq.httpBody = try? JSONSerialization.data(withJSONObject: createPayload)
+
+        let sem = DispatchSemaphore(value: 0)
+        var createdId: String?
+        URLSession.shared.dataTask(with: createReq) { data, resp, _ in
+            if let http = resp as? HTTPURLResponse, (http.statusCode == 200 || http.statusCode == 201),
+               let data = data,
+               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+               let newId = json["id"] as? String, !newId.isEmpty {
+                createdId = newId
+            }
+            sem.signal()
+        }.resume()
+        sem.wait()
+
+        if let id = createdId {
+            cachedParentId = parentId
+            cachedDayName = dayName
+            cachedDayId = id
+            return id
+        }
+        return nil
+    }
+
     func upload(filename: String, mimeType: String, imageData: Data, folderName: String = defaultDriveFolderName) -> Bool {
         guard ensureAccessToken() else { return false }
         if auth.driveFolderId.isEmpty {
             ensureDriveFolder(folderName: folderName)
         }
 
+        var targetFolderId = auth.driveFolderId
+        if !auth.driveFolderId.isEmpty,
+           let dayId = ensureDaySubfolder(parentId: auth.driveFolderId, dayName: extractDayName(from: filename)) {
+            targetFolderId = dayId
+        }
+
         var metaObj: [String: Any] = ["name": filename]
-        if !auth.driveFolderId.isEmpty {
-            metaObj["parents"] = [auth.driveFolderId]
+        if !targetFolderId.isEmpty {
+            metaObj["parents"] = [targetFolderId]
         }
         guard let metaData = try? JSONSerialization.data(withJSONObject: metaObj) else { return false }
 

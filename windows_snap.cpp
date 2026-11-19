@@ -35,7 +35,7 @@
 namespace fs = std::filesystem;
 
 #ifndef SNAP_VERSION
-#define SNAP_VERSION "1.2.0"
+#define SNAP_VERSION "1.2.1"
 #endif
 
 // Override at compile time via -DDEFAULT_CLIENT_ID="..." -DDEFAULT_CLIENT_SECRET="..."
@@ -841,6 +841,84 @@ bool ensureDriveFolder(AuthData& auth, const fs::path& authFile, const std::stri
     return false;
 }
 
+std::string extractDayName(const std::string& filename) {
+    if (filename.size() >= 10 &&
+        isdigit(static_cast<unsigned char>(filename[0])) &&
+        filename[4] == '-' && filename[7] == '-') {
+        return filename.substr(0, 10);
+    }
+    std::time_t now = std::time(nullptr);
+    std::tm tmNow{};
+    localtime_s(&tmNow, &now);
+    char buf[16];
+    std::strftime(buf, sizeof(buf), "%Y-%m-%d", &tmNow);
+    return std::string(buf);
+}
+
+bool ensureDaySubfolder(
+    const std::string& parentId,
+    const std::string& dayName,
+    const std::string& token,
+    std::string& outDayFolderId
+) {
+    if (parentId.empty() || dayName.empty()) return false;
+
+    static std::mutex dayMtx;
+    static std::string cachedParentId;
+    static std::string cachedDayName;
+    static std::string cachedDayId;
+
+    std::lock_guard<std::mutex> lock(dayMtx);
+    if (parentId == cachedParentId && dayName == cachedDayName && !cachedDayId.empty()) {
+        outDayFolderId = cachedDayId;
+        return true;
+    }
+
+    std::string query = "name='" + dayName + "' and '" + parentId +
+                        "' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false";
+    std::string searchPath = "/drive/v3/files?q=" + urlEncode(query) + "&fields=files(id,name)&pageSize=1";
+    std::wstring authHeader = L"Authorization: Bearer " + toWide(token) + L"\r\n";
+
+    HttpResponse searchResp = httpGet(L"www.googleapis.com", toWide(searchPath), authHeader);
+    if (searchResp.networkOk && searchResp.statusCode == 200) {
+        std::string existingId = jsonExtractString(searchResp.body, "id");
+        if (!existingId.empty()) {
+            cachedParentId = parentId;
+            cachedDayName = dayName;
+            cachedDayId = existingId;
+            outDayFolderId = existingId;
+            return true;
+        }
+    }
+
+    std::string createBody = "{\"name\":\"" + jsonEscape(dayName) +
+                             "\",\"mimeType\":\"application/vnd.google-apps.folder\",\"parents\":[\"" +
+                             jsonEscape(parentId) + "\"]}";
+    std::wstring createHeaders =
+        L"Authorization: Bearer " + toWide(token) + L"\r\n"
+        L"Content-Type: application/json; charset=UTF-8\r\n";
+
+    HttpResponse createResp = httpPost(
+        L"www.googleapis.com",
+        L"/drive/v3/files",
+        createHeaders,
+        createBody.data(),
+        static_cast<DWORD>(createBody.size())
+    );
+
+    if (createResp.networkOk && (createResp.statusCode == 200 || createResp.statusCode == 201)) {
+        std::string newId = jsonExtractString(createResp.body, "id");
+        if (!newId.empty()) {
+            cachedParentId = parentId;
+            cachedDayName = dayName;
+            cachedDayId = newId;
+            outDayFolderId = newId;
+            return true;
+        }
+    }
+    return false;
+}
+
 bool uploadBytesToDrive(
     AuthData& auth,
     const fs::path& authFile,
@@ -856,9 +934,17 @@ bool uploadBytesToDrive(
     std::string folderId;
     ensureDriveFolder(auth, authFile, folderName, folderId);
 
-    std::string metadata = "{\"name\":\"" + jsonEscape(filename) + "\"";
+    std::string targetFolderId = folderId;
     if (!folderId.empty()) {
-        metadata += ",\"parents\":[\"" + jsonEscape(folderId) + "\"]";
+        std::string dayFolderId;
+        if (ensureDaySubfolder(folderId, extractDayName(filename), token, dayFolderId)) {
+            targetFolderId = dayFolderId;
+        }
+    }
+
+    std::string metadata = "{\"name\":\"" + jsonEscape(filename) + "\"";
+    if (!targetFolderId.empty()) {
+        metadata += ",\"parents\":[\"" + jsonEscape(targetFolderId) + "\"]";
     }
     metadata += "}";
 
