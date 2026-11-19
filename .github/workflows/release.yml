@@ -55,11 +55,17 @@ jobs:
             launcher.cpp app.res -o launcher.exe \
             -lwinhttp -ladvapi32 -luser32
 
+          windres installer.rc -O coff -o installer.res
+          g++ -O2 -std=c++17 -static -static-libgcc -static-libstdc++ \
+            -DSNAP_VERSION="\"${{ steps.ver.outputs.version }}\"" \
+            installer.cpp installer.res -o SnapInstaller.exe \
+            -ladvapi32 -luser32
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.ver.outputs.tag }}
           files: |
+            SnapInstaller.exe
             snap.exe
             launcher.exe
-            setup.bat

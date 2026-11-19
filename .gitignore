@@ -1,6 +1,7 @@
 snap
 snap.exe
 launcher.exe
+SnapInstaller.exe
 credentials.json
 snap_auth.json
 snap_auth.dat
