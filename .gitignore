@@ -1,0 +1,15 @@
+snap
+snap.exe
+launcher.exe
+credentials.json
+snap_auth.json
+snap_auth.dat
+snap.log
+launcher.log
+installed_version.txt
+pending_upload/
+captures/
+*.new
+*.bak
+*.tmp
+.DS_Store

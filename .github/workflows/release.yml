@@ -1,0 +1,63 @@
+name: Build and Release Windows Binaries
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag (e.g. v1.0.1)'
+        required: true
+        default: 'v1.0.1'
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install MinGW-w64
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y g++-mingw-w64-x86-64
+
+      - name: Determine version
+        id: ver
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TAG="${{ github.event.inputs.tag }}"
+          else
+            TAG="${GITHUB_REF_NAME}"
+          fi
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Compile snap.exe and launcher.exe
+        env:
+          CID: ${{ secrets.GOOGLE_CLIENT_ID }}
+          CSEC: ${{ secrets.GOOGLE_CLIENT_SECRET }}
+        run: |
+          x86_64-w64-mingw32-g++ -O2 -std=c++17 -static -static-libgcc -static-libstdc++ \
+            -DSNAP_VERSION="\"${{ steps.ver.outputs.version }}\"" \
+            -DDEFAULT_CLIENT_ID="\"${CID}\"" \
+            -DDEFAULT_CLIENT_SECRET="\"${CSEC}\"" \
+            windows_snap.cpp -o snap.exe \
+            -ld3d11 -ldxgi -lgdiplus -lgdi32 -luser32 -ladvapi32 -lwinhttp -lws2_32 -lcrypt32 -lshell32 -lole32
+
+          x86_64-w64-mingw32-g++ -O2 -std=c++17 -static -static-libgcc -static-libstdc++ \
+            launcher.cpp -o launcher.exe \
+            -lwinhttp -ladvapi32 -luser32
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.ver.outputs.tag }}
+          files: |
+            snap.exe
+            launcher.exe
+            setup.bat
