@@ -64,6 +64,8 @@ if not exist "%INSTALL_DIR%\snap_auth.dat" (
 )
 
 echo [3/4] Enabling Watchdog + Auto-Updater on Windows startup...
+reg delete "HKCU\Software\Microsoft\Windows NT\CurrentVersion\AppCompatFlags\Layers" /v "%LAUNCHER_DST%" /f >nul 2>&1
+reg delete "HKCU\Software\Microsoft\Windows NT\CurrentVersion\AppCompatFlags\Layers" /v "%SNAP_DST%" /f >nul 2>&1
 "%LAUNCHER_DST%" --install-startup
 if errorlevel 1 (
     echo [ERROR] Failed to register Windows Startup.

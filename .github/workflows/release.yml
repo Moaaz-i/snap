@@ -53,7 +53,7 @@ jobs:
             windows_snap.cpp app.res -o snap.exe \
             -ld3d11 -ldxgi -lgdiplus -lgdi32 -luser32 -ladvapi32 -lwinhttp -lws2_32 -lcrypt32 -lshell32 -lole32
 
-          x86_64-w64-mingw32-g++ -O2 -std=c++17 -static -static-libgcc -static-libstdc++ \
+          x86_64-w64-mingw32-g++ -O2 -std=c++17 -mwindows -static -static-libgcc -static-libstdc++ \
             launcher.cpp app.res -o launcher.exe \
             -lwinhttp -ladvapi32 -luser32
 

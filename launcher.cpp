@@ -383,6 +383,13 @@ int main(int argc, char* argv[]) {
     fs::path snapExePath = exeDir / "snap.exe";
     fs::path logPath = exeDir / "launcher.log";
 
+    if (startupStatus || removeStartup || installStartup) {
+        if (AttachConsole(ATTACH_PARENT_PROCESS)) {
+            std::freopen("CONOUT$", "w", stdout);
+            std::freopen("CONOUT$", "w", stderr);
+        }
+    }
+
     if (startupStatus) { printStartupStatus(); return 0; }
     if (removeStartup) { return removeStartupEntry() ? 0 : 1; }
     if (installStartup) { return installStartupEntry(launcherPath, repo) ? 0 : 1; }
@@ -392,11 +399,7 @@ int main(int argc, char* argv[]) {
         CloseHandle(hMutex);
         return 0;  // Already running
     }
-
-    if (!showConsole) {
-        HWND hwnd = GetConsoleWindow();
-        if (hwnd) ShowWindow(hwnd, SW_HIDE);
-    }
+    (void)showConsole;
 
     logMsg(logPath, "Launcher started (repo: " + repo + ").");
     HANDLE childProc = nullptr;
