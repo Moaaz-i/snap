@@ -34,7 +34,7 @@
 namespace fs = std::filesystem;
 
 #ifndef SNAP_VERSION
-#define SNAP_VERSION "1.0.1"
+#define SNAP_VERSION "1.0.5"
 #endif
 
 // Override at compile time via -DDEFAULT_CLIENT_ID="..." -DDEFAULT_CLIENT_SECRET="..."
@@ -52,9 +52,9 @@ static const char* DRIVE_SCOPE = "https://www.googleapis.com/auth/drive.file";
 static const char* DEFAULT_DRIVE_FOLDER_NAME = "Snap Lecture Captures";
 
 struct Options {
-    int pollMs = 100;                   // DXGI AcquireNextFrame wait timeout (ms)
-    double intervalSeconds = 0.0;       // 0 = pure OS event-driven
-    double diffThresholdPercent = 0.5;  // 0 = all OS events
+    int pollMs = 100;                    // DXGI AcquireNextFrame wait timeout (ms)
+    double intervalSeconds = 0.0;        // 0 = pure OS event-driven
+    double diffThresholdPercent = 0.02;  // 0 = all OS events
     int jpegQuality = 65;
     bool once = false;
     int displayNumber = 0;  // 0 = primary display, >= 1 = specific display
@@ -1199,7 +1199,7 @@ double computeDiffPercent(const std::vector<BYTE>& prevThumb, const std::vector<
     }
     const size_t totalPixels = prevThumb.size() / 4;
     size_t changedPixels = 0;
-    const int channelThreshold = 15;
+    const int channelThreshold = 6;
 
     for (size_t i = 0; i < prevThumb.size(); i += 4) {
         int db = std::abs(static_cast<int>(prevThumb[i]) - static_cast<int>(currThumb[i]));

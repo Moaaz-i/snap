@@ -17,7 +17,7 @@ let defaultDriveFolderName = "Snap Lecture Captures"
 // MARK: - CLI Options
 
 struct Options {
-    var diffThresholdPercent: Double = 0.5
+    var diffThresholdPercent: Double = 0.02
     var once = false
     var displayNumber: Int? = nil
     var format = "jpg"
@@ -669,7 +669,7 @@ func computeSampleDiffPercent(prev: [UInt8], curr: [UInt8]) -> Double {
     guard !prev.isEmpty, prev.count == curr.count else { return 100.0 }
     let total = prev.count / 3
     var changed = 0
-    let threshold = 15
+    let threshold = 6
     var i = 0
     while i < prev.count {
         let db = abs(Int(prev[i]) - Int(curr[i]))
