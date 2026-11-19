@@ -26,6 +26,7 @@
 #include <iostream>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -34,7 +35,7 @@
 namespace fs = std::filesystem;
 
 #ifndef SNAP_VERSION
-#define SNAP_VERSION "1.0.5"
+#define SNAP_VERSION "1.0.8"
 #endif
 
 // Override at compile time via -DDEFAULT_CLIENT_ID="..." -DDEFAULT_CLIENT_SECRET="..."
@@ -1032,14 +1033,16 @@ RECT getCaptureRect(int displayNumber, bool& ok) {
 }
 
 std::string makeTimestampFilename(const fs::path& checkDir, const std::string& format) {
+    static std::mutex nameMtx;
     static std::string lastTs;
     static int sameSecSeq = 0;
+    std::lock_guard<std::mutex> lock(nameMtx);
 
     std::time_t now = std::time(nullptr);
     std::tm tmNow{};
     localtime_s(&tmNow, &now);
-    char buf[32];
-    std::strftime(buf, sizeof(buf), "%Y-%m-%d_%H-%M-%S", &tmNow);
+    char buf[40];
+    std::strftime(buf, sizeof(buf), "%Y-%m-%d %I.%M.%S %p", &tmNow);
 
     std::string ts(buf);
     if (ts == lastTs) {
@@ -1050,12 +1053,13 @@ std::string makeTimestampFilename(const fs::path& checkDir, const std::string& f
     }
 
     std::string base = (sameSecSeq == 0)
-        ? ("screen_" + ts)
-        : ("screen_" + ts + "_" + std::to_string(sameSecSeq));
+        ? ts
+        : (ts + " (" + std::to_string(sameSecSeq + 1) + ")");
     std::string name = base + "." + format;
-    int counter = 1;
-    while (!checkDir.empty() && fs::exists(checkDir / name)) {
-        name = base + "_" + std::to_string(counter) + "." + format;
+    int counter = 2;
+    std::error_code ec;
+    while (!checkDir.empty() && fs::exists(checkDir / name, ec)) {
+        name = base + " (" + std::to_string(counter) + ")." + format;
         ++counter;
     }
     return name;
@@ -1493,8 +1497,9 @@ public:
     UploadWorker(AuthData& auth, fs::path authFile, fs::path queueDir, std::string folderName, bool quiet)
         : auth_(auth), authFile_(std::move(authFile)), queueDir_(std::move(queueDir)),
           folderName_(std::move(folderName)), quiet_(quiet) {
-        threads_.emplace_back(&UploadWorker::run, this, 0);
-        threads_.emplace_back(&UploadWorker::run, this, 1);
+        for (int i = 0; i < 4; ++i) {
+            threads_.emplace_back(&UploadWorker::run, this);
+        }
     }
 
     ~UploadWorker() {
@@ -1547,26 +1552,108 @@ private:
         std::vector<BYTE> data;
     };
 
-    void run(int workerId) {
-        while (true) {
-            if (workerId == 0) {
-                flushPendingQueue(queueDir_, auth_, authFile_, folderName_, quiet_);
-            }
+    bool claimNextPendingFile(fs::path& outPath) {
+        std::error_code ec;
+        if (!fs::exists(queueDir_, ec)) return false;
 
+        auto now = std::chrono::steady_clock::now();
+        if (now < offlineUntil_) return false;
+
+        if (pendingCache_.empty()) {
+            for (const auto& entry : fs::directory_iterator(queueDir_, ec)) {
+                if (ec) break;
+                if (entry.is_regular_file(ec)) {
+                    fs::path p = entry.path();
+                    if (inFlightFiles_.find(p) == inFlightFiles_.end()) {
+                        pendingCache_.push_back(std::move(p));
+                    }
+                }
+            }
+            std::sort(pendingCache_.begin(), pendingCache_.end());
+        }
+
+        while (!pendingCache_.empty()) {
+            fs::path p = std::move(pendingCache_.front());
+            pendingCache_.pop_front();
+            if (inFlightFiles_.find(p) == inFlightFiles_.end() && fs::exists(p, ec)) {
+                inFlightFiles_.insert(p);
+                outPath = std::move(p);
+                return true;
+            }
+        }
+        return false;
+    }
+
+    void run() {
+        while (true) {
+            fs::path pendingFile;
             Item item;
+            bool hasPending = false;
             bool hasItem = false;
             bool shouldStop = false;
+
             {
                 std::unique_lock<std::mutex> lock(mtx_);
-                if (queue_.empty() && !stopRequested_) {
-                    cv_.wait_for(lock, std::chrono::seconds(2));
-                }
-                if (!queue_.empty()) {
+                // Priority 1: Drain stored/queued files from pending_upload/ in parallel first
+                if (claimNextPendingFile(pendingFile)) {
+                    hasPending = true;
+                } else if (!queue_.empty() && std::chrono::steady_clock::now() >= offlineUntil_) {
+                    // Priority 2: Upload new live captures
                     item = std::move(queue_.front());
                     queue_.pop_front();
                     hasItem = true;
+                } else if (!stopRequested_) {
+                    cv_.wait_for(lock, std::chrono::seconds(2));
+                    continue;
+                } else {
+                    if (!queue_.empty()) {
+                        item = std::move(queue_.front());
+                        queue_.pop_front();
+                        hasItem = true;
+                    } else {
+                        shouldStop = true;
+                    }
                 }
-                shouldStop = stopRequested_ && queue_.empty();
+            }
+
+            if (hasPending) {
+                try {
+                    std::vector<BYTE> data;
+                    if (readBytesFromFile(pendingFile, data)) {
+                        std::string ext = pendingFile.extension().string();
+                        std::string mime = (ext == ".png" || ext == ".PNG") ? "image/png" : "image/jpeg";
+                        if (uploadBytesToDrive(auth_, authFile_, folderName_, pendingFile.filename().string(), mime, data)) {
+                            std::error_code ec;
+                            fs::remove(pendingFile, ec);
+                            int cnt = 0;
+                            {
+                                std::lock_guard<std::mutex> lock(mtx_);
+                                inFlightFiles_.erase(pendingFile);
+                                cnt = ++uploadedCount_;
+                            }
+                            logMsg("Queue uploaded & deleted: " + pendingFile.filename().string());
+                            if (!quiet_) {
+                                std::cout << "[" << cnt << "] [Queue] Uploaded & deleted: "
+                                          << pendingFile.filename().string() << std::endl;
+                            }
+                        } else {
+                            std::lock_guard<std::mutex> lock(mtx_);
+                            inFlightFiles_.erase(pendingFile);
+                            offlineUntil_ = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+                        }
+                    } else {
+                        std::lock_guard<std::mutex> lock(mtx_);
+                        inFlightFiles_.erase(pendingFile);
+                    }
+                } catch (const std::exception& e) {
+                    std::lock_guard<std::mutex> lock(mtx_);
+                    inFlightFiles_.erase(pendingFile);
+                    logMsg(std::string("Pending worker exception: ") + e.what());
+                } catch (...) {
+                    std::lock_guard<std::mutex> lock(mtx_);
+                    inFlightFiles_.erase(pendingFile);
+                }
+                continue;
             }
 
             if (hasItem) {
@@ -1583,6 +1670,10 @@ private:
                                       << " (" << (item.data.size() / 1024) << " KB)" << std::endl;
                         }
                     } else {
+                        {
+                            std::lock_guard<std::mutex> lock(mtx_);
+                            offlineUntil_ = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+                        }
                         std::error_code ec;
                         fs::create_directories(queueDir_, ec);
                         fs::path qPath = queueDir_ / item.name;
@@ -1615,6 +1706,9 @@ private:
     std::mutex mtx_;
     std::condition_variable cv_;
     std::deque<Item> queue_;
+    std::deque<fs::path> pendingCache_;
+    std::set<fs::path> inFlightFiles_;
+    std::chrono::steady_clock::time_point offlineUntil_{};
     bool stopRequested_ = false;
     bool stopped_ = false;
     int uploadedCount_ = 0;

@@ -508,7 +508,7 @@ func timestampFilename(format: String, checkDir: URL? = nil) -> String {
 
     let df = DateFormatter()
     df.locale = Locale(identifier: "en_US_POSIX")
-    df.dateFormat = "yyyy-MM-dd_HH-mm-ss"
+    df.dateFormat = "yyyy-MM-dd hh.mm.ss a"
     let ts = df.string(from: Date())
     if ts == lastBaseTimestamp {
         sameSecondSeq += 1
@@ -516,12 +516,12 @@ func timestampFilename(format: String, checkDir: URL? = nil) -> String {
         lastBaseTimestamp = ts
         sameSecondSeq = 0
     }
-    let base = (sameSecondSeq == 0) ? "screen_\(ts)" : "screen_\(ts)_\(sameSecondSeq)"
+    let base = (sameSecondSeq == 0) ? ts : "\(ts) (\(sameSecondSeq + 1))"
     var name = "\(base).\(format)"
     if let dir = checkDir {
-        var counter = 1
+        var counter = 2
         while FileManager.default.fileExists(atPath: dir.appendingPathComponent(name).path) {
-            name = "\(base)_\(counter).\(format)"
+            name = "\(base) (\(counter)).\(format)"
             counter += 1
         }
     }
