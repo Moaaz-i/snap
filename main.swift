@@ -667,11 +667,19 @@ func samplePixelBuffer(_ pixelBuffer: CVPixelBuffer) -> [UInt8]? {
 
 func computeSampleDiffPercent(prev: [UInt8], curr: [UInt8]) -> Double {
     guard !prev.isEmpty, prev.count == curr.count else { return 100.0 }
-    let total = prev.count / 3
+    // Exclude top 4% (macOS menu bar & clock) and bottom 6% (Dock)
+    let startRow = (sampleGridH * 4) / 100
+    let endRow = (sampleGridH * 94) / 100
+    let rowBytes = sampleGridW * 3
+    let startByte = startRow * rowBytes
+    let endByte = min(prev.count, endRow * rowBytes)
+    guard endByte > startByte else { return 100.0 }
+
+    let total = (endByte - startByte) / 3
     var changed = 0
     let threshold = 6
-    var i = 0
-    while i < prev.count {
+    var i = startByte
+    while i < endByte {
         let db = abs(Int(prev[i]) - Int(curr[i]))
         let dg = abs(Int(prev[i + 1]) - Int(curr[i + 1]))
         let dr = abs(Int(prev[i + 2]) - Int(curr[i + 2]))

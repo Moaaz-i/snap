@@ -157,13 +157,14 @@ std::string jsonExtractStringAfter(const std::string& json, const std::string& k
     return val;
 }
 
-std::string findSnapExeDownloadUrl(const std::string& json) {
+std::string findAssetDownloadUrl(const std::string& json, const std::string& assetName) {
     size_t pos = 0;
+    std::string suffix = "/" + assetName;
     while (true) {
         size_t found = json.find("\"browser_download_url\"", pos);
         if (found == std::string::npos) break;
         std::string url = jsonExtractStringAfter(json, "browser_download_url", found);
-        if (url.size() >= 8 && url.substr(url.size() - 8) == "snap.exe") {
+        if (url.size() >= suffix.size() && url.substr(url.size() - suffix.size()) == suffix) {
             return url;
         }
         pos = found + 20;
@@ -305,30 +306,32 @@ void stopSnapProcess(HANDLE& hProc) {
     hProc = nullptr;
 }
 
-void checkAndApplyUpdate(
+bool checkAndApplyUpdate(
     const std::string& repo,
     const fs::path& exeDir,
     const fs::path& snapExePath,
+    const fs::path& launcherPath,
     const fs::path& logPath,
-    HANDLE& childProc
+    HANDLE& childProc,
+    HANDLE& hMutex
 ) {
     std::string apiUrl = "https://api.github.com/repos/" + repo + "/releases/latest";
     std::vector<BYTE> body;
     DWORD status = 0;
     if (!httpGetUrl(apiUrl, body, status)) {
-        return;  // Offline or no release published yet
+        return false;  // Offline or no release published yet
     }
 
     std::string json(reinterpret_cast<const char*>(body.data()), body.size());
     std::string remoteTag = normalizeVersion(jsonExtractStringAfter(json, "tag_name"));
-    std::string dlUrl = findSnapExeDownloadUrl(json);
+    std::string dlUrl = findAssetDownloadUrl(json, "snap.exe");
     if (remoteTag.empty() || dlUrl.empty()) {
-        return;
+        return false;
     }
 
     std::string localVer = readInstalledVersion(exeDir);
     if (remoteTag == localVer) {
-        return;
+        return false;
     }
 
     logMsg(logPath, "New version available: " + remoteTag + " (current: " + localVer + "). Downloading...");
@@ -337,16 +340,16 @@ void checkAndApplyUpdate(
     if (!httpGetUrl(dlUrl, exeBytes, dlStatus) || exeBytes.size() < 100 * 1024 ||
         exeBytes[0] != 'M' || exeBytes[1] != 'Z') {
         logMsg(logPath, "Update download failed or invalid binary (HTTP " + std::to_string(dlStatus) + ").");
-        return;
+        return false;
     }
 
     fs::path newPath = exeDir / "snap.exe.new";
     fs::path bakPath = exeDir / "snap.exe.bak";
     {
         std::ofstream f(newPath, std::ios::binary | std::ios::trunc);
-        if (!f) return;
+        if (!f) return false;
         f.write(reinterpret_cast<const char*>(exeBytes.data()), static_cast<std::streamsize>(exeBytes.size()));
-        if (!f.good()) return;
+        if (!f.good()) return false;
     }
 
     stopSnapProcess(childProc);
@@ -378,12 +381,61 @@ void checkAndApplyUpdate(
             MoveFileExW(bakPath.wstring().c_str(), snapExePath.wstring().c_str(), MOVEFILE_REPLACE_EXISTING);
         }
         fs::remove(newPath, ec);
-        return;
+        return false;
     }
 
     writeInstalledVersion(exeDir, remoteTag);
     logMsg(logPath, "Updated snap.exe to version " + remoteTag + " successfully.");
+
+    // Also self-update launcher.exe if present in the release
+    std::string launcherUrl = findAssetDownloadUrl(json, "launcher.exe");
+    if (!launcherUrl.empty()) {
+        std::vector<BYTE> launcherBytes;
+        DWORD lStatus = 0;
+        if (httpGetUrl(launcherUrl, launcherBytes, lStatus) && launcherBytes.size() >= 100 * 1024 &&
+            launcherBytes[0] == 'M' && launcherBytes[1] == 'Z') {
+            fs::path newLauncher = exeDir / "launcher.exe.new";
+            fs::path oldLauncher = exeDir / "launcher.old.exe";
+            std::ofstream lf(newLauncher, std::ios::binary | std::ios::trunc);
+            if (lf) {
+                lf.write(reinterpret_cast<const char*>(launcherBytes.data()),
+                         static_cast<std::streamsize>(launcherBytes.size()));
+                lf.close();
+                if (lf.good()) {
+                    fs::remove(oldLauncher, ec);
+                    if (MoveFileExW(launcherPath.wstring().c_str(), oldLauncher.wstring().c_str(),
+                                    MOVEFILE_REPLACE_EXISTING)) {
+                        if (MoveFileExW(newLauncher.wstring().c_str(), launcherPath.wstring().c_str(),
+                                        MOVEFILE_REPLACE_EXISTING)) {
+                            logMsg(logPath, "Self-updated launcher.exe to " + remoteTag + ". Restarting launcher...");
+                            if (hMutex) {
+                                ReleaseMutex(hMutex);
+                                CloseHandle(hMutex);
+                                hMutex = nullptr;
+                            }
+                            STARTUPINFOW si{};
+                            si.cb = sizeof(si);
+                            PROCESS_INFORMATION pi{};
+                            std::wstring cmd = L"\"" + launcherPath.wstring() + L"\" --repo \"" + toWide(repo) + L"\"";
+                            if (CreateProcessW(launcherPath.wstring().c_str(), &cmd[0], nullptr, nullptr, FALSE,
+                                               DETACHED_PROCESS, nullptr, exeDir.wstring().c_str(), &si, &pi)) {
+                                CloseHandle(pi.hThread);
+                                CloseHandle(pi.hProcess);
+                                return true;  // Exit old launcher instance
+                            }
+                        } else {
+                            MoveFileExW(oldLauncher.wstring().c_str(), launcherPath.wstring().c_str(),
+                                        MOVEFILE_REPLACE_EXISTING);
+                        }
+                    }
+                    fs::remove(newLauncher, ec);
+                }
+            }
+        }
+    }
+
     childProc = startSnapProcess(snapExePath, exeDir);
+    return false;
 }
 
 int main(int argc, char* argv[]) {
@@ -436,6 +488,9 @@ int main(int argc, char* argv[]) {
     }
     (void)showConsole;
 
+    std::error_code ec;
+    fs::remove(exeDir / "launcher.old.exe", ec);
+
     logMsg(logPath, "Launcher started (repo: " + repo + ").");
     HANDLE childProc = nullptr;
     // Start snap.exe immediately; delay first GitHub update check by 45s so network/boot never delays capture
@@ -463,7 +518,9 @@ int main(int argc, char* argv[]) {
 
         auto now = std::chrono::steady_clock::now();
         if (std::chrono::duration_cast<std::chrono::seconds>(now - lastUpdateCheck).count() >= checkIntervalSec) {
-            checkAndApplyUpdate(repo, exeDir, snapExePath, logPath, childProc);
+            if (checkAndApplyUpdate(repo, exeDir, snapExePath, launcherPath, logPath, childProc, hMutex)) {
+                return 0;  // Self-updated; new launcher instance is already running
+            }
             lastUpdateCheck = std::chrono::steady_clock::now();
         }
 

@@ -35,7 +35,7 @@
 namespace fs = std::filesystem;
 
 #ifndef SNAP_VERSION
-#define SNAP_VERSION "1.0.9"
+#define SNAP_VERSION "1.1.0"
 #endif
 
 // Override at compile time via -DDEFAULT_CLIENT_ID="..." -DDEFAULT_CLIENT_SECRET="..."
@@ -1201,11 +1201,18 @@ double computeDiffPercent(const std::vector<BYTE>& prevThumb, const std::vector<
     if (prevThumb.empty() || prevThumb.size() != currThumb.size()) {
         return 100.0;
     }
-    const size_t totalPixels = prevThumb.size() / 4;
+    // Exclude bottom 6% (Windows taskbar, system tray, clock, and toast area)
+    const int activeRows = (DIFF_H * 94) / 100;
+    const size_t activePixels = static_cast<size_t>(DIFF_W) * static_cast<size_t>(activeRows);
+    const size_t activeBytes = activePixels * 4;
+    if (activeBytes == 0 || activeBytes > prevThumb.size()) {
+        return 100.0;
+    }
+
     size_t changedPixels = 0;
     const int channelThreshold = 6;
 
-    for (size_t i = 0; i < prevThumb.size(); i += 4) {
+    for (size_t i = 0; i < activeBytes; i += 4) {
         int db = std::abs(static_cast<int>(prevThumb[i]) - static_cast<int>(currThumb[i]));
         int dg = std::abs(static_cast<int>(prevThumb[i + 1]) - static_cast<int>(currThumb[i + 1]));
         int dr = std::abs(static_cast<int>(prevThumb[i + 2]) - static_cast<int>(currThumb[i + 2]));
@@ -1213,7 +1220,7 @@ double computeDiffPercent(const std::vector<BYTE>& prevThumb, const std::vector<
             ++changedPixels;
         }
     }
-    return (static_cast<double>(changedPixels) * 100.0) / static_cast<double>(totalPixels);
+    return (static_cast<double>(changedPixels) * 100.0) / static_cast<double>(activePixels);
 }
 
 // MARK: - DXGI Desktop Duplication (OS Event-Driven Screen Capture)
