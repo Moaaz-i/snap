@@ -198,7 +198,39 @@ void writeInstalledVersion(const fs::path& exeDir, const std::string& v) {
     if (f) f << v << "\n";
 }
 
+bool runHiddenCommand(const std::wstring& cmdLine, DWORD& outExitCode) {
+    STARTUPINFOW si{};
+    si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESHOWWINDOW;
+    si.wShowWindow = SW_HIDE;
+    PROCESS_INFORMATION pi{};
+    std::wstring cmd = cmdLine;
+    if (!CreateProcessW(nullptr, &cmd[0], nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) {
+        return false;
+    }
+    WaitForSingleObject(pi.hProcess, 10000);
+    GetExitCodeProcess(pi.hProcess, &outExitCode);
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+    return true;
+}
+
 bool installStartupEntry(const fs::path& launcherPath, const std::string& repo) {
+    std::wstring tr = L"\\\"" + launcherPath.wstring() + L"\\\" --repo \\\"" + toWide(repo) + L"\\\"";
+    std::wstring schCmd = L"schtasks /Create /TN \"SnapLectureCapture\" /TR \"" + tr + L"\" /SC ONLOGON /RL LIMITED /F";
+    DWORD exitCode = 1;
+    if (runHiddenCommand(schCmd, exitCode) && exitCode == 0) {
+        // Remove legacy HKCU\Run entry so it doesn't duplicate or get delayed
+        HKEY hKey = nullptr;
+        if (RegOpenKeyExW(HKEY_CURRENT_USER, REG_RUN_KEY, 0, KEY_SET_VALUE, &hKey) == ERROR_SUCCESS) {
+            RegDeleteValueW(hKey, REG_VALUE_NAME);
+            RegCloseKey(hKey);
+        }
+        std::wcout << L"Startup enabled (Instant Task Scheduler ONLOGON): " << launcherPath.wstring() << L"\n";
+        return true;
+    }
+
+    // Fallback to HKCU\Run
     HKEY hKey = nullptr;
     LONG res = RegOpenKeyExW(HKEY_CURRENT_USER, REG_RUN_KEY, 0, KEY_SET_VALUE, &hKey);
     if (res != ERROR_SUCCESS) return false;
@@ -207,20 +239,23 @@ bool installStartupEntry(const fs::path& launcherPath, const std::string& repo) 
     res = RegSetValueExW(hKey, REG_VALUE_NAME, 0, REG_SZ, reinterpret_cast<const BYTE*>(cmd.c_str()), sz);
     RegCloseKey(hKey);
     if (res == ERROR_SUCCESS) {
-        std::wcout << L"Startup enabled (Watchdog + Auto-Updater): " << cmd << L"\n";
+        std::wcout << L"Startup enabled (HKCU Run): " << cmd << L"\n";
         return true;
     }
     return false;
 }
 
 bool removeStartupEntry() {
+    DWORD exitCode = 1;
+    runHiddenCommand(L"schtasks /Delete /TN \"SnapLectureCapture\" /F", exitCode);
+
     HKEY hKey = nullptr;
     LONG res = RegOpenKeyExW(HKEY_CURRENT_USER, REG_RUN_KEY, 0, KEY_SET_VALUE, &hKey);
-    if (res != ERROR_SUCCESS) return false;
+    if (res != ERROR_SUCCESS) return (exitCode == 0);
     res = RegDeleteValueW(hKey, REG_VALUE_NAME);
     RegCloseKey(hKey);
     std::cout << "Startup disabled.\n";
-    return (res == ERROR_SUCCESS || res == ERROR_FILE_NOT_FOUND);
+    return (exitCode == 0 || res == ERROR_SUCCESS || res == ERROR_FILE_NOT_FOUND);
 }
 
 void printStartupStatus() {
@@ -403,15 +438,11 @@ int main(int argc, char* argv[]) {
 
     logMsg(logPath, "Launcher started (repo: " + repo + ").");
     HANDLE childProc = nullptr;
-    auto lastUpdateCheck = std::chrono::steady_clock::now() - std::chrono::seconds(checkIntervalSec);
+    // Start snap.exe immediately; delay first GitHub update check by 45s so network/boot never delays capture
+    int initialDelay = std::max(0, checkIntervalSec - 45);
+    auto lastUpdateCheck = std::chrono::steady_clock::now() - std::chrono::seconds(initialDelay);
 
     while (g_running) {
-        auto now = std::chrono::steady_clock::now();
-        if (std::chrono::duration_cast<std::chrono::seconds>(now - lastUpdateCheck).count() >= checkIntervalSec) {
-            checkAndApplyUpdate(repo, exeDir, snapExePath, logPath, childProc);
-            lastUpdateCheck = std::chrono::steady_clock::now();
-        }
-
         bool alive = (childProc != nullptr && WaitForSingleObject(childProc, 0) == WAIT_TIMEOUT);
         if (!alive) {
             if (childProc) {
@@ -428,6 +459,12 @@ int main(int argc, char* argv[]) {
                     logMsg(logPath, "Failed to start snap.exe.");
                 }
             }
+        }
+
+        auto now = std::chrono::steady_clock::now();
+        if (std::chrono::duration_cast<std::chrono::seconds>(now - lastUpdateCheck).count() >= checkIntervalSec) {
+            checkAndApplyUpdate(repo, exeDir, snapExePath, logPath, childProc);
+            lastUpdateCheck = std::chrono::steady_clock::now();
         }
 
         std::this_thread::sleep_for(std::chrono::seconds(2));
