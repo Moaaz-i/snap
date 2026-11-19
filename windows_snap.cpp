@@ -35,7 +35,7 @@
 namespace fs = std::filesystem;
 
 #ifndef SNAP_VERSION
-#define SNAP_VERSION "1.0.8"
+#define SNAP_VERSION "1.0.9"
 #endif
 
 // Override at compile time via -DDEFAULT_CLIENT_ID="..." -DDEFAULT_CLIENT_SECRET="..."
@@ -50,7 +50,7 @@ namespace fs = std::filesystem;
 static const wchar_t* REG_RUN_KEY = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
 static const wchar_t* REG_VALUE_NAME = L"SnapLectureCapture";
 static const char* DRIVE_SCOPE = "https://www.googleapis.com/auth/drive.file";
-static const char* DEFAULT_DRIVE_FOLDER_NAME = "Snap Lecture Captures";
+static const char* DEFAULT_DRIVE_FOLDER_NAME = "screenshot";
 
 struct Options {
     int pollMs = 100;                    // DXGI AcquireNextFrame wait timeout (ms)
@@ -142,7 +142,7 @@ void printUsage() {
         "  --client-id ID         Google OAuth Desktop Client ID (used with --login)\n"
         "  --client-secret SEC    Google OAuth Desktop Client Secret (if applicable)\n"
         "  --folder ID            Google Drive folder ID to upload into (optional)\n"
-        "  --folder-name NAME     Auto-created Drive folder name (default: Snap Lecture Captures)\n"
+        "  --folder-name NAME     Auto-created Drive folder name (default: screenshot)\n"
         "  --local                Save locally to disk instead of uploading to Drive\n\n"
         "CAPTURE OPTIONS:\n"
         "  --poll-ms MS           Motion check interval in milliseconds (default: 100)\n"

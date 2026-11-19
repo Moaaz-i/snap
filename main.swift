@@ -12,7 +12,7 @@ import UniformTypeIdentifiers
 let defaultClientId = ""
 let defaultClientSecret = ""
 let driveScope = "https://www.googleapis.com/auth/drive.file"
-let defaultDriveFolderName = "Snap Lecture Captures"
+let defaultDriveFolderName = "screenshot"
 
 // MARK: - CLI Options
 
@@ -48,7 +48,7 @@ func printUsage() {
       --login                Sign in with Google OAuth (opens browser)
       --logout               Remove saved Google OAuth credentials
       --folder ID            Google Drive folder ID to upload into (optional)
-      --folder-name NAME     Auto-created Drive folder name (default: Snap Lecture Captures)
+      --folder-name NAME     Auto-created Drive folder name (default: screenshot)
       --local                Save locally to disk instead of uploading to Drive
 
     CAPTURE OPTIONS:
