@@ -34,7 +34,7 @@
 namespace fs = std::filesystem;
 
 #ifndef SNAP_VERSION
-#define SNAP_VERSION "1.0.0"
+#define SNAP_VERSION "1.0.1"
 #endif
 
 // Override at compile time via -DDEFAULT_CLIENT_ID="..." -DDEFAULT_CLIENT_SECRET="..."
@@ -52,10 +52,10 @@ static const char* DRIVE_SCOPE = "https://www.googleapis.com/auth/drive.file";
 static const char* DEFAULT_DRIVE_FOLDER_NAME = "Snap Lecture Captures";
 
 struct Options {
-    int pollMs = 250;                   // DXGI AcquireNextFrame wait timeout (ms)
+    int pollMs = 100;                   // DXGI AcquireNextFrame wait timeout (ms)
     double intervalSeconds = 0.0;       // 0 = pure OS event-driven
     double diffThresholdPercent = 0.5;  // 0 = all OS events
-    int jpegQuality = 80;
+    int jpegQuality = 65;
     bool once = false;
     int displayNumber = 0;  // 0 = primary display, >= 1 = specific display
     std::string format = "jpg";
@@ -472,6 +472,24 @@ struct HttpResponse {
     bool networkOk = false;
 };
 
+HINTERNET getSharedWinHttpSession() {
+    static std::mutex sessionMtx;
+    static HINTERNET hSession = nullptr;
+    std::lock_guard<std::mutex> lock(sessionMtx);
+    if (!hSession) {
+        hSession = WinHttpOpen(L"SnapLectureCapture/1.0", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+                               WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+        if (hSession) {
+            WinHttpSetTimeouts(hSession, 8000, 8000, 20000, 20000);
+#ifdef WINHTTP_OPTION_ENABLE_HTTP_PROTOCOL
+            DWORD http2 = WINHTTP_PROTOCOL_FLAG_HTTP2;
+            WinHttpSetOption(hSession, WINHTTP_OPTION_ENABLE_HTTP_PROTOCOL, &http2, sizeof(http2));
+#endif
+        }
+    }
+    return hSession;
+}
+
 HttpResponse httpRequest(
     const std::wstring& method,
     const std::wstring& host,
@@ -481,15 +499,11 @@ HttpResponse httpRequest(
     DWORD bodySize
 ) {
     HttpResponse resp;
-    HINTERNET hSession = WinHttpOpen(L"SnapLectureCapture/1.0", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
-                                     WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+    HINTERNET hSession = getSharedWinHttpSession();
     if (!hSession) return resp;
-
-    WinHttpSetTimeouts(hSession, 10000, 10000, 30000, 30000);
 
     HINTERNET hConnect = WinHttpConnect(hSession, host.c_str(), INTERNET_DEFAULT_HTTPS_PORT, 0);
     if (!hConnect) {
-        WinHttpCloseHandle(hSession);
         return resp;
     }
 
@@ -497,7 +511,6 @@ HttpResponse httpRequest(
                                             WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, WINHTTP_FLAG_SECURE);
     if (!hRequest) {
         WinHttpCloseHandle(hConnect);
-        WinHttpCloseHandle(hSession);
         return resp;
     }
 
@@ -532,7 +545,6 @@ HttpResponse httpRequest(
 
     WinHttpCloseHandle(hRequest);
     WinHttpCloseHandle(hConnect);
-    WinHttpCloseHandle(hSession);
     return resp;
 }
 
@@ -728,9 +740,13 @@ bool performOAuthLogin(AuthData& auth, const fs::path& authFile) {
     return true;
 }
 
-bool ensureAccessToken(AuthData& auth) {
+static std::mutex g_authMtx;
+
+bool ensureAccessToken(AuthData& auth, std::string& outToken) {
+    std::lock_guard<std::mutex> lock(g_authMtx);
     auto now = std::chrono::steady_clock::now();
     if (!auth.accessToken.empty() && now < auth.accessTokenExpiry) {
+        outToken = auth.accessToken;
         return true;
     }
 
@@ -760,20 +776,32 @@ bool ensureAccessToken(AuthData& auth) {
     long long expiresIn = jsonExtractInt(resp.body, "expires_in", 3600);
     auth.accessToken = newTok;
     auth.accessTokenExpiry = std::chrono::steady_clock::now() + std::chrono::seconds(std::max(60LL, expiresIn - 60));
+    outToken = newTok;
     return true;
 }
 
-bool ensureDriveFolder(AuthData& auth, const fs::path& authFile, const std::string& folderName) {
-    if (!auth.driveFolderId.empty()) {
-        return true;
+bool ensureDriveFolder(AuthData& auth, const fs::path& authFile, const std::string& folderName, std::string& outFolderId) {
+    {
+        std::lock_guard<std::mutex> lock(g_authMtx);
+        if (!auth.driveFolderId.empty()) {
+            outFolderId = auth.driveFolderId;
+            return true;
+        }
     }
-    if (!ensureAccessToken(auth)) {
+    std::string token;
+    if (!ensureAccessToken(auth, token)) {
         return false;
+    }
+
+    std::lock_guard<std::mutex> lock(g_authMtx);
+    if (!auth.driveFolderId.empty()) {
+        outFolderId = auth.driveFolderId;
+        return true;
     }
 
     std::string query = "name='" + folderName + "' and mimeType='application/vnd.google-apps.folder' and trashed=false";
     std::string searchPath = "/drive/v3/files?q=" + urlEncode(query) + "&fields=files(id,name)&pageSize=1";
-    std::wstring authHeader = L"Authorization: Bearer " + toWide(auth.accessToken) + L"\r\n";
+    std::wstring authHeader = L"Authorization: Bearer " + toWide(token) + L"\r\n";
 
     HttpResponse searchResp = httpGet(L"www.googleapis.com", toWide(searchPath), authHeader);
     if (searchResp.networkOk && searchResp.statusCode == 200) {
@@ -781,6 +809,7 @@ bool ensureDriveFolder(AuthData& auth, const fs::path& authFile, const std::stri
         if (!existingId.empty()) {
             auth.driveFolderId = existingId;
             saveAuthData(authFile, auth);
+            outFolderId = existingId;
             return true;
         }
     }
@@ -788,7 +817,7 @@ bool ensureDriveFolder(AuthData& auth, const fs::path& authFile, const std::stri
     std::string createBody = "{\"name\":\"" + jsonEscape(folderName) +
                              "\",\"mimeType\":\"application/vnd.google-apps.folder\"}";
     std::wstring createHeaders =
-        L"Authorization: Bearer " + toWide(auth.accessToken) + L"\r\n"
+        L"Authorization: Bearer " + toWide(token) + L"\r\n"
         L"Content-Type: application/json; charset=UTF-8\r\n";
 
     HttpResponse createResp = httpPost(
@@ -804,6 +833,7 @@ bool ensureDriveFolder(AuthData& auth, const fs::path& authFile, const std::stri
         if (!newId.empty()) {
             auth.driveFolderId = newId;
             saveAuthData(authFile, auth);
+            outFolderId = newId;
             return true;
         }
     }
@@ -818,16 +848,16 @@ bool uploadBytesToDrive(
     const std::string& mimeType,
     const std::vector<BYTE>& imageBytes
 ) {
-    if (!ensureAccessToken(auth)) {
+    std::string token;
+    if (!ensureAccessToken(auth, token)) {
         return false;
     }
-    if (auth.driveFolderId.empty()) {
-        ensureDriveFolder(auth, authFile, folderName);
-    }
+    std::string folderId;
+    ensureDriveFolder(auth, authFile, folderName, folderId);
 
     std::string metadata = "{\"name\":\"" + jsonEscape(filename) + "\"";
-    if (!auth.driveFolderId.empty()) {
-        metadata += ",\"parents\":[\"" + jsonEscape(auth.driveFolderId) + "\"]";
+    if (!folderId.empty()) {
+        metadata += ",\"parents\":[\"" + jsonEscape(folderId) + "\"]";
     }
     metadata += "}";
 
@@ -847,7 +877,7 @@ bool uploadBytesToDrive(
     body.insert(body.end(), part3.begin(), part3.end());
 
     std::wstring headers =
-        L"Authorization: Bearer " + toWide(auth.accessToken) + L"\r\n"
+        L"Authorization: Bearer " + toWide(token) + L"\r\n"
         L"Content-Type: multipart/related; boundary=" + toWide(boundary) + L"\r\n";
 
     HttpResponse resp = httpPost(
@@ -859,10 +889,13 @@ bool uploadBytesToDrive(
     );
 
     if (resp.statusCode == 401) {
-        auth.accessToken.clear();
-        if (ensureAccessToken(auth)) {
+        {
+            std::lock_guard<std::mutex> lock(g_authMtx);
+            auth.accessToken.clear();
+        }
+        if (ensureAccessToken(auth, token)) {
             headers =
-                L"Authorization: Bearer " + toWide(auth.accessToken) + L"\r\n"
+                L"Authorization: Bearer " + toWide(token) + L"\r\n"
                 L"Content-Type: multipart/related; boundary=" + toWide(boundary) + L"\r\n";
             resp = httpPost(
                 L"www.googleapis.com",
@@ -1459,8 +1492,10 @@ class UploadWorker {
 public:
     UploadWorker(AuthData& auth, fs::path authFile, fs::path queueDir, std::string folderName, bool quiet)
         : auth_(auth), authFile_(std::move(authFile)), queueDir_(std::move(queueDir)),
-          folderName_(std::move(folderName)), quiet_(quiet),
-          thread_(&UploadWorker::run, this) {}
+          folderName_(std::move(folderName)), quiet_(quiet) {
+        threads_.emplace_back(&UploadWorker::run, this, 0);
+        threads_.emplace_back(&UploadWorker::run, this, 1);
+    }
 
     ~UploadWorker() {
         stopAndJoin();
@@ -1490,9 +1525,11 @@ public:
             if (stopped_) return;
             stopRequested_ = true;
         }
-        cv_.notify_one();
-        if (thread_.joinable()) {
-            thread_.join();
+        cv_.notify_all();
+        for (auto& t : threads_) {
+            if (t.joinable()) {
+                t.join();
+            }
         }
         std::lock_guard<std::mutex> lock(mtx_);
         stopped_ = true;
@@ -1510,9 +1547,11 @@ private:
         std::vector<BYTE> data;
     };
 
-    void run() {
+    void run(int workerId) {
         while (true) {
-            flushPendingQueue(queueDir_, auth_, authFile_, folderName_, quiet_);
+            if (workerId == 0) {
+                flushPendingQueue(queueDir_, auth_, authFile_, folderName_, quiet_);
+            }
 
             Item item;
             bool hasItem = false;
@@ -1579,7 +1618,7 @@ private:
     bool stopRequested_ = false;
     bool stopped_ = false;
     int uploadedCount_ = 0;
-    std::thread thread_;
+    std::vector<std::thread> threads_;
 };
 
 void runInteractiveSetup(Options& opts, AuthData& auth, const fs::path& authFile, const fs::path& exeDir) {
