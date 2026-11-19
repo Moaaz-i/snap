@@ -9,6 +9,7 @@ launcher.log
 installed_version.txt
 pending_upload/
 captures/
+*.res
 *.new
 *.bak
 *.tmp

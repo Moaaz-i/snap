@@ -315,20 +315,34 @@ void checkAndApplyUpdate(
     }
 
     stopSnapProcess(childProc);
-    // Also ensure no stray snap.exe holds the file lock
     std::this_thread::sleep_for(std::chrono::milliseconds(500));
 
     std::error_code ec;
     fs::remove(bakPath, ec);
     if (fs::exists(snapExePath, ec)) {
-        fs::rename(snapExePath, bakPath, ec);
-    }
-    fs::rename(newPath, snapExePath, ec);
-    if (ec) {
-        logMsg(logPath, "Failed to replace snap.exe: " + ec.message());
-        if (fs::exists(bakPath, ec) && !fs::exists(snapExePath, ec)) {
-            fs::rename(bakPath, snapExePath, ec);
+        for (int attempt = 0; attempt < 6; ++attempt) {
+            if (MoveFileExW(snapExePath.wstring().c_str(), bakPath.wstring().c_str(), MOVEFILE_REPLACE_EXISTING)) {
+                break;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(500));
         }
+    }
+
+    bool replaced = false;
+    for (int attempt = 0; attempt < 6; ++attempt) {
+        if (MoveFileExW(newPath.wstring().c_str(), snapExePath.wstring().c_str(), MOVEFILE_REPLACE_EXISTING)) {
+            replaced = true;
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    }
+
+    if (!replaced) {
+        logMsg(logPath, "Failed to replace snap.exe (error " + std::to_string(GetLastError()) + "). Rolling back.");
+        if (fs::exists(bakPath, ec) && !fs::exists(snapExePath, ec)) {
+            MoveFileExW(bakPath.wstring().c_str(), snapExePath.wstring().c_str(), MOVEFILE_REPLACE_EXISTING);
+        }
+        fs::remove(newPath, ec);
         return;
     }
 
