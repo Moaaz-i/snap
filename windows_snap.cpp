@@ -35,7 +35,7 @@
 namespace fs = std::filesystem;
 
 #ifndef SNAP_VERSION
-#define SNAP_VERSION "1.1.0"
+#define SNAP_VERSION "1.2.0"
 #endif
 
 // Override at compile time via -DDEFAULT_CLIENT_ID="..." -DDEFAULT_CLIENT_SECRET="..."
@@ -1210,7 +1210,7 @@ double computeDiffPercent(const std::vector<BYTE>& prevThumb, const std::vector<
     }
 
     size_t changedPixels = 0;
-    const int channelThreshold = 6;
+    const int channelThreshold = 10;
 
     for (size_t i = 0; i < activeBytes; i += 4) {
         int db = std::abs(static_cast<int>(prevThumb[i]) - static_cast<int>(currThumb[i]));
@@ -2005,9 +2005,32 @@ int main(int argc, char* argv[]) {
         }
     };
 
+    std::deque<std::vector<BYTE>> recentThumbs;
+    auto isDuplicateOfRecent = [&](const std::vector<BYTE>& thumb) {
+        if (opts.diffThresholdPercent <= 0.0) return false;
+        for (const auto& r : recentThumbs) {
+            if (computeDiffPercent(r, thumb) < opts.diffThresholdPercent) {
+                return true;
+            }
+        }
+        return false;
+    };
+    auto recordRecent = [&](const std::vector<BYTE>& thumb) {
+        if (thumb.empty()) return;
+        recentThumbs.push_back(thumb);
+        if (recentThumbs.size() > 3) recentThumbs.pop_front();
+    };
+
     // Take 1 initial shot at startup
     processCapture(true);
+    recordRecent(prevThumb);
     auto lastCapture = std::chrono::steady_clock::now();
+
+    bool hasPending = false;
+    std::vector<BYTE> pendingBytes;
+    std::vector<BYTE> pendingThumb;
+    std::chrono::steady_clock::time_point firstMotionTime{};
+    std::chrono::steady_clock::time_point lastMotionTime{};
 
     while (g_running) {
         auto now = std::chrono::steady_clock::now();
@@ -2026,11 +2049,33 @@ int main(int argc, char* argv[]) {
                 prevThumb,
                 dxgiBytes
             );
-            if (res == 1 && cooldownOk) {
-                emitCapturedBytes(dxgiBytes);
-                lastCapture = std::chrono::steady_clock::now();
+            if (res == 1) {
+                auto tNow = std::chrono::steady_clock::now();
+                if (!hasPending) {
+                    firstMotionTime = tNow;
+                    hasPending = true;
+                }
+                lastMotionTime = tNow;
+                pendingBytes = std::move(dxgiBytes);
+                pendingThumb = prevThumb;
             } else if (res == -1) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            }
+
+            if (hasPending && cooldownOk) {
+                auto tNow = std::chrono::steady_clock::now();
+                auto sinceLast = std::chrono::duration_cast<std::chrono::milliseconds>(tNow - lastMotionTime).count();
+                auto sinceFirst = std::chrono::duration_cast<std::chrono::milliseconds>(tNow - firstMotionTime).count();
+                if (sinceLast >= 450 || sinceFirst >= 2000) {
+                    if (!isDuplicateOfRecent(pendingThumb)) {
+                        emitCapturedBytes(pendingBytes);
+                        recordRecent(pendingThumb);
+                        lastCapture = tNow;
+                    }
+                    hasPending = false;
+                    pendingBytes.clear();
+                    pendingThumb.clear();
+                }
             }
         } else {
             if (cooldownOk) {
@@ -2045,7 +2090,10 @@ int main(int argc, char* argv[]) {
             if (ch == 'q' || ch == 'Q') {
                 break;
             } else if (ch == ' ' || ch == '\r' || ch == '\n') {
+                hasPending = false;
+                pendingBytes.clear();
                 processCapture(true);
+                recordRecent(prevThumb);
                 lastCapture = std::chrono::steady_clock::now();
             }
         }

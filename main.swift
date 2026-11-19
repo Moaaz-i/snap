@@ -677,7 +677,7 @@ func computeSampleDiffPercent(prev: [UInt8], curr: [UInt8]) -> Double {
 
     let total = (endByte - startByte) / 3
     var changed = 0
-    let threshold = 6
+    let threshold = 10
     var i = startByte
     while i < endByte {
         let db = abs(Int(prev[i]) - Int(curr[i]))
@@ -743,6 +743,11 @@ final class EventStreamCapturer: NSObject, SCStreamOutput, SCStreamDelegate {
 
     private let stateLock = NSLock()
     private var prevSample: [UInt8] = []
+    private var recentSamples: [[UInt8]] = []
+    private var pendingData: Data? = nil
+    private var pendingSample: [UInt8]? = nil
+    private var firstMotionTime: Date? = nil
+    private var settleWorkItem: DispatchWorkItem? = nil
     private var stream: SCStream?
     private let streamQueue = DispatchQueue(label: "snap.scstream.output", qos: .userInitiated)
 
@@ -853,13 +858,72 @@ final class EventStreamCapturer: NSObject, SCStreamOutput, SCStreamDelegate {
         stateLock.lock()
         let isFirst = prevSample.isEmpty
         let diff = isFirst ? 100.0 : computeSampleDiffPercent(prev: prevSample, curr: currSample)
-        let shouldCapture = isFirst || (diffThresholdPercent == 0.0) || (diff >= diffThresholdPercent)
-        if shouldCapture {
+        let shouldConsider = isFirst || (diffThresholdPercent == 0.0) || (diff >= diffThresholdPercent)
+        if shouldConsider {
             prevSample = currSample
         }
         stateLock.unlock()
 
-        if shouldCapture, let data = encodePixelBuffer(pixelBuffer, format: format) {
+        guard shouldConsider, let data = encodePixelBuffer(pixelBuffer, format: format) else {
+            return
+        }
+
+        if isFirst {
+            stateLock.lock()
+            recentSamples.append(currSample)
+            stateLock.unlock()
+            onImage(data)
+            return
+        }
+
+        stateLock.lock()
+        if firstMotionTime == nil {
+            firstMotionTime = Date()
+        }
+        pendingData = data
+        pendingSample = currSample
+        settleWorkItem?.cancel()
+
+        let elapsed = Date().timeIntervalSince(firstMotionTime!)
+        if elapsed >= 2.0 {
+            flushPendingLocked()
+            stateLock.unlock()
+            return
+        }
+
+        let work = DispatchWorkItem { [weak self] in
+            guard let self = self else { return }
+            self.stateLock.lock()
+            self.flushPendingLocked()
+            self.stateLock.unlock()
+        }
+        settleWorkItem = work
+        stateLock.unlock()
+        streamQueue.asyncAfter(deadline: .now() + 0.45, execute: work)
+    }
+
+    private func flushPendingLocked() {
+        guard let data = pendingData, let sample = pendingSample else {
+            firstMotionTime = nil
+            return
+        }
+        pendingData = nil
+        pendingSample = nil
+        firstMotionTime = nil
+        settleWorkItem = nil
+
+        if diffThresholdPercent > 0.0 {
+            for r in recentSamples {
+                if computeSampleDiffPercent(prev: r, curr: sample) < diffThresholdPercent {
+                    return
+                }
+            }
+        }
+        recentSamples.append(sample)
+        if recentSamples.count > 3 {
+            recentSamples.removeFirst()
+        }
+        DispatchQueue.global(qos: .userInitiated).async { [onImage] in
             onImage(data)
         }
     }
