@@ -22,6 +22,7 @@
    - `snap.exe --install-startup -i 5 --background` — تفعيل التشغيل التلقائي عند بدء Windows في الخلفية.
    - `snap.exe --remove-startup` — إلغاء التشغيل التلقائي.
    - `snap.exe --local` — الحفظ محلياً فقط بدون Google Drive.
+   - `snap.exe --clean-drive` — إفراغ Google Drive وسلة المهملات بالكامل بشكل نهائي مع إبقاء الصور الموجودة داخل مجلد التطبيق (`screenshot`) كما هي (يدعم `-y` / `--yes` لتخطي رسالة التأكيد).
    - `snap.exe --logout` — حذف بيانات تسجيل الدخول المحفوظة.
 
 ## إعادة البناء

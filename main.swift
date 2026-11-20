@@ -11,7 +11,7 @@ import UniformTypeIdentifiers
 // Reads ./credentials.json automatically if present
 let defaultClientId = ""
 let defaultClientSecret = ""
-let driveScope = "https://www.googleapis.com/auth/drive.file"
+let driveScope = "https://www.googleapis.com/auth/drive"
 let defaultDriveFolderName = "screenshot"
 
 // MARK: - CLI Options
@@ -27,6 +27,8 @@ struct Options {
     var driveFolderName = defaultDriveFolderName
     var doLogin = false
     var doLogout = false
+    var cleanDrive = false
+    var assumeYes = false
     var showHelp = false
 }
 
@@ -49,6 +51,9 @@ func printUsage() {
       --logout               Remove saved Google OAuth credentials
       --folder ID            Google Drive folder ID to upload into (optional)
       --folder-name NAME     Auto-created Drive folder name (default: screenshot)
+      --clean-drive          Permanently delete everything in Google Drive & Trash
+                             EXCEPT images inside the app's folder
+      -y, --yes              Skip confirmation prompt for --clean-drive
       --local                Save locally to disk instead of uploading to Drive
 
     CAPTURE OPTIONS:
@@ -79,6 +84,10 @@ func parseArgs(_ args: [String]) -> Options? {
             opts.doLogin = true
         case "--logout":
             opts.doLogout = true
+        case "--clean-drive":
+            opts.cleanDrive = true
+        case "-y", "--yes":
+            opts.assumeYes = true
         case "--folder":
             i += 1
             guard i < args.count, !args[i].isEmpty else {
@@ -563,6 +572,243 @@ final class DriveClient {
         }.resume()
         sem.wait()
         return statusCode
+    }
+
+    private func sendAuthorizedRequest(method: String, url: URL) -> (Int, Data?) {
+        func execute() -> (Int, Data?) {
+            var req = URLRequest(url: url)
+            req.httpMethod = method
+            req.timeoutInterval = 30
+            req.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
+            let sem = DispatchSemaphore(value: 0)
+            var statusCode = 0
+            var respData: Data?
+            URLSession.shared.dataTask(with: req) { data, resp, _ in
+                if let http = resp as? HTTPURLResponse {
+                    statusCode = http.statusCode
+                }
+                respData = data
+                sem.signal()
+            }.resume()
+            sem.wait()
+            return (statusCode, respData)
+        }
+
+        let first = execute()
+        if first.0 == 401 {
+            accessToken = ""
+            if ensureAccessToken() {
+                return execute()
+            }
+        }
+        return first
+    }
+
+    private func verifyFolderExistsAndActive(folderId: String) -> Bool {
+        guard !folderId.isEmpty else { return false }
+        var comps = URLComponents(string: "https://www.googleapis.com/drive/v3/files/\(folderId)")!
+        comps.queryItems = [URLQueryItem(name: "fields", value: "id,trashed")]
+        guard let url = comps.url else { return false }
+        let (status, data) = sendAuthorizedRequest(method: "GET", url: url)
+        guard status == 200,
+              let data = data,
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let id = json["id"] as? String, !id.isEmpty else {
+            return false
+        }
+        let trashed = (json["trashed"] as? Bool) ?? false
+        return !trashed
+    }
+
+    func cleanGoogleDrive(folderName: String, assumeYes: Bool) -> Bool {
+        guard ensureAccessToken() else {
+            fputs("Error: Could not obtain Google Drive access token.\n", stderr)
+            return false
+        }
+
+        if !auth.driveFolderId.isEmpty && !verifyFolderExistsAndActive(folderId: auth.driveFolderId) {
+            auth.driveFolderId = ""
+        }
+        if !ensureDriveFolder(folderName: folderName) || auth.driveFolderId.isEmpty {
+            fputs("Error: Could not locate or create the app's Google Drive folder ('\(folderName)'). Aborting cleanup to protect your files.\n", stderr)
+            return false
+        }
+        let appFolderId = auth.driveFolderId
+
+        struct DriveItem {
+            let id: String
+            let name: String
+            let mimeType: String
+            let parents: [String]
+        }
+
+        print("Scanning Google Drive...")
+        fflush(stdout)
+        var allFiles: [DriveItem] = []
+        var pageToken: String? = nil
+
+        while true {
+            var comps = URLComponents(string: "https://www.googleapis.com/drive/v3/files")!
+            var items = [
+                URLQueryItem(name: "q", value: "'me' in owners and trashed=false"),
+                URLQueryItem(name: "fields", value: "nextPageToken,files(id,name,mimeType,parents)"),
+                URLQueryItem(name: "pageSize", value: "1000"),
+            ]
+            if let tok = pageToken, !tok.isEmpty {
+                items.append(URLQueryItem(name: "pageToken", value: tok))
+            }
+            comps.queryItems = items
+            guard let url = comps.url else { return false }
+
+            let (status, data) = sendAuthorizedRequest(method: "GET", url: url)
+            guard status == 200,
+                  let data = data,
+                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                if status == 403 {
+                    fputs("Error (HTTP 403): Insufficient Google Drive permissions.\nPlease re-authenticate with full Drive access:\n  ./snap --logout\n  ./snap --login\n", stderr)
+                } else {
+                    fputs("Error listing Google Drive files (HTTP \(status)).\n", stderr)
+                }
+                return false
+            }
+
+            if let files = json["files"] as? [[String: Any]] {
+                for f in files {
+                    guard let id = f["id"] as? String, !id.isEmpty else { continue }
+                    let name = (f["name"] as? String) ?? ""
+                    let mime = (f["mimeType"] as? String) ?? ""
+                    let parents = (f["parents"] as? [String]) ?? []
+                    allFiles.append(DriveItem(id: id, name: name, mimeType: mime, parents: parents))
+                }
+            }
+
+            if let next = json["nextPageToken"] as? String, !next.isEmpty {
+                pageToken = next
+            } else {
+                break
+            }
+        }
+
+        var fileMap: [String: DriveItem] = [:]
+        fileMap.reserveCapacity(allFiles.count)
+        for f in allFiles {
+            fileMap[f.id] = f
+        }
+
+        // Protect appFolderId and any of its ancestor folders
+        var protectedAncestors: Set<String> = [appFolderId]
+        var ancStack = [appFolderId]
+        while let cur = ancStack.popLast() {
+            if let item = fileMap[cur] {
+                for p in item.parents where !protectedAncestors.contains(p) {
+                    protectedAncestors.insert(p)
+                    ancStack.append(p)
+                }
+            }
+        }
+
+        func isInsideAppFolder(_ id: String) -> Bool {
+            guard let item0 = fileMap[id] else { return false }
+            var visited = Set<String>()
+            var stack = item0.parents
+            while let cur = stack.popLast() {
+                if cur == appFolderId { return true }
+                if !visited.insert(cur).inserted { continue }
+                if let item = fileMap[cur] {
+                    stack.append(contentsOf: item.parents)
+                }
+            }
+            return false
+        }
+
+        var toDeleteIds = Set<String>()
+        var keptImages = 0
+        var keptSubfolders = 0
+
+        for f in allFiles {
+            if protectedAncestors.contains(f.id) {
+                continue
+            }
+            if isInsideAppFolder(f.id) {
+                if f.mimeType.hasPrefix("image/") {
+                    keptImages += 1
+                    continue
+                }
+                if f.mimeType == "application/vnd.google-apps.folder" {
+                    keptSubfolders += 1
+                    continue
+                }
+                toDeleteIds.insert(f.id)
+            } else {
+                toDeleteIds.insert(f.id)
+            }
+        }
+
+        let deleteTargets = allFiles.filter { f in
+            guard toDeleteIds.contains(f.id) else { return false }
+            if !f.parents.isEmpty && f.parents.allSatisfy({ toDeleteIds.contains($0) }) {
+                return false
+            }
+            return true
+        }
+
+        print("\n=== Google Drive Cleanup Summary ===")
+        print("  Protected folder : \(folderName) (ID: \(appFolderId))")
+        print("  Images kept      : \(keptImages) (in \(keptSubfolders) subfolder(s))")
+        print("  Items to delete  : \(toDeleteIds.count) (\(deleteTargets.count) top-level file(s)/folder(s))")
+        print("  Trash            : Will be permanently emptied\n")
+
+        if !assumeYes {
+            print("WARNING: This will PERMANENTLY delete everything in Google Drive")
+            print("outside '\(folderName)' (and empty Trash). This cannot be undone!")
+            print("Type YES to confirm: ", terminator: "")
+            fflush(stdout)
+            let confirm = (readLine() ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+            if confirm != "YES" && confirm != "yes" {
+                print("Cleanup cancelled.")
+                return false
+            }
+        }
+
+        var deletedCount = 0
+        var failedCount = 0
+        var scopeError = false
+
+        for (idx, item) in deleteTargets.enumerated() {
+            let escapedId = item.id.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? item.id
+            guard let url = URL(string: "https://www.googleapis.com/drive/v3/files/\(escapedId)") else { continue }
+            let (status, _) = sendAuthorizedRequest(method: "DELETE", url: url)
+            if status == 200 || status == 204 || status == 404 {
+                deletedCount += 1
+                print("[\(idx + 1)/\(deleteTargets.count)] Deleted: \(item.name)")
+                fflush(stdout)
+            } else {
+                failedCount += 1
+                if status == 403 { scopeError = true }
+                fputs("[\(idx + 1)/\(deleteTargets.count)] Failed to delete '\(item.name)' (HTTP \(status))\n", stderr)
+            }
+        }
+
+        print("Emptying Google Drive Trash...")
+        fflush(stdout)
+        let (trashStatus, _) = sendAuthorizedRequest(
+            method: "DELETE",
+            url: URL(string: "https://www.googleapis.com/drive/v3/files/trash")!
+        )
+        let trashOk = (trashStatus == 200 || trashStatus == 204)
+        if trashOk {
+            print("Trash emptied permanently.")
+        } else {
+            if trashStatus == 403 { scopeError = true }
+            fputs("Warning: Could not empty Trash (HTTP \(trashStatus)).\n", stderr)
+        }
+
+        if scopeError {
+            fputs("\nNote: Some operations returned HTTP 403 (insufficient permissions).\nRun `./snap --logout` then `./snap --login` to grant full Drive access.\n", stderr)
+        }
+
+        print("\nCleanup complete. Deleted: \(deletedCount), Failed: \(failedCount), Kept images: \(keptImages).")
+        return failedCount == 0 && trashOk
     }
 
     private func postForm(url: URL, params: [String: String]) -> (Int, [String: Any])? {
@@ -1122,6 +1368,18 @@ func main() -> Int32 {
             at: URL(fileURLWithPath: opts.outputDir, isDirectory: true),
             withIntermediateDirectories: true
         )
+    }
+
+    if opts.cleanDrive {
+        if opts.localOnly {
+            fputs("Error: --clean-drive cannot be used with --local.\n", stderr)
+            return 1
+        }
+        guard let drive = driveClient else {
+            fputs("Error: Google Drive client is not initialized.\n", stderr)
+            return 1
+        }
+        return drive.cleanGoogleDrive(folderName: opts.driveFolderName, assumeYes: opts.assumeYes) ? 0 : 1
     }
 
     var localShotCount = 0
