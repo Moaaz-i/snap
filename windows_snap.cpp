@@ -30,12 +30,14 @@
 #include <sstream>
 #include <string>
 #include <thread>
+#include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace fs = std::filesystem;
 
 #ifndef SNAP_VERSION
-#define SNAP_VERSION "1.2.1"
+#define SNAP_VERSION "1.3.0"
 #endif
 
 // Override at compile time via -DDEFAULT_CLIENT_ID="..." -DDEFAULT_CLIENT_SECRET="..."
@@ -49,7 +51,7 @@ namespace fs = std::filesystem;
 
 static const wchar_t* REG_RUN_KEY = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
 static const wchar_t* REG_VALUE_NAME = L"SnapLectureCapture";
-static const char* DRIVE_SCOPE = "https://www.googleapis.com/auth/drive.file";
+static const char* DRIVE_SCOPE = "https://www.googleapis.com/auth/drive";
 static const char* DEFAULT_DRIVE_FOLDER_NAME = "screenshot";
 
 struct Options {
@@ -70,6 +72,8 @@ struct Options {
     bool startupStatus = false;
     bool doLogin = false;
     bool doLogout = false;
+    bool cleanDrive = false;
+    bool assumeYes = false;
     std::string clientId;
     std::string clientSecret;
     bool setup = false;
@@ -143,6 +147,9 @@ void printUsage() {
         "  --client-secret SEC    Google OAuth Desktop Client Secret (if applicable)\n"
         "  --folder ID            Google Drive folder ID to upload into (optional)\n"
         "  --folder-name NAME     Auto-created Drive folder name (default: screenshot)\n"
+        "  --clean-drive          Permanently delete everything in Google Drive & Trash\n"
+        "                         EXCEPT images inside the app's folder\n"
+        "  -y, --yes              Skip confirmation prompt for --clean-drive\n"
         "  --local                Save locally to disk instead of uploading to Drive\n\n"
         "CAPTURE OPTIONS:\n"
         "  --poll-ms MS           Motion check interval in milliseconds (default: 100)\n"
@@ -187,6 +194,10 @@ bool parseArgs(int argc, char* argv[], Options& opts) {
             opts.doLogin = true;
         } else if (arg == "--logout") {
             opts.doLogout = true;
+        } else if (arg == "--clean-drive") {
+            opts.cleanDrive = true;
+        } else if (arg == "-y" || arg == "--yes") {
+            opts.assumeYes = true;
         } else if (arg == "--setup") {
             opts.setup = true;
         } else if (arg == "--client-id") {
@@ -565,6 +576,14 @@ HttpResponse httpGet(
     const std::wstring& headers
 ) {
     return httpRequest(L"GET", host, path, headers, nullptr, 0);
+}
+
+HttpResponse httpDelete(
+    const std::wstring& host,
+    const std::wstring& path,
+    const std::wstring& headers
+) {
+    return httpRequest(L"DELETE", host, path, headers, nullptr, 0);
 }
 
 // MARK: - OAuth 2.0 PKCE Login & Token Refresh
@@ -995,6 +1014,445 @@ bool uploadBytesToDrive(
     }
 
     return resp.networkOk && (resp.statusCode == 200 || resp.statusCode == 201);
+}
+
+// MARK: - Google Drive Full Cleanup (Keep Only Images Inside App Folder)
+
+struct DriveFileInfo {
+    std::string id;
+    std::string name;
+    std::string mimeType;
+    std::vector<std::string> parents;
+};
+
+static void jsonSkipWs(const std::string& s, size_t& pos) {
+    while (pos < s.size() && (s[pos] == ' ' || s[pos] == '\t' || s[pos] == '\r' || s[pos] == '\n')) {
+        ++pos;
+    }
+}
+
+static bool jsonParseStringAt(const std::string& s, size_t& pos, std::string& out) {
+    jsonSkipWs(s, pos);
+    if (pos >= s.size() || s[pos] != '"') return false;
+    ++pos;
+    out.clear();
+    while (pos < s.size()) {
+        char c = s[pos++];
+        if (c == '\\' && pos < s.size()) {
+            char esc = s[pos++];
+            switch (esc) {
+                case '"': out.push_back('"'); break;
+                case '\\': out.push_back('\\'); break;
+                case '/': out.push_back('/'); break;
+                case 'n': out.push_back('\n'); break;
+                case 'r': out.push_back('\r'); break;
+                case 't': out.push_back('\t'); break;
+                case 'b': out.push_back('\b'); break;
+                case 'f': out.push_back('\f'); break;
+                case 'u':
+                    if (pos + 4 <= s.size()) pos += 4;
+                    break;
+                default: out.push_back(esc); break;
+            }
+        } else if (c == '"') {
+            return true;
+        } else {
+            out.push_back(c);
+        }
+    }
+    return false;
+}
+
+static void jsonSkipValue(const std::string& s, size_t& pos) {
+    jsonSkipWs(s, pos);
+    if (pos >= s.size()) return;
+    char c = s[pos];
+    if (c == '"') {
+        std::string dummy;
+        jsonParseStringAt(s, pos, dummy);
+    } else if (c == '{') {
+        ++pos;
+        jsonSkipWs(s, pos);
+        if (pos < s.size() && s[pos] == '}') { ++pos; return; }
+        while (pos < s.size()) {
+            std::string k;
+            if (!jsonParseStringAt(s, pos, k)) break;
+            jsonSkipWs(s, pos);
+            if (pos < s.size() && s[pos] == ':') ++pos;
+            jsonSkipValue(s, pos);
+            jsonSkipWs(s, pos);
+            if (pos < s.size() && s[pos] == ',') { ++pos; continue; }
+            if (pos < s.size() && s[pos] == '}') { ++pos; break; }
+            break;
+        }
+    } else if (c == '[') {
+        ++pos;
+        jsonSkipWs(s, pos);
+        if (pos < s.size() && s[pos] == ']') { ++pos; return; }
+        while (pos < s.size()) {
+            jsonSkipValue(s, pos);
+            jsonSkipWs(s, pos);
+            if (pos < s.size() && s[pos] == ',') { ++pos; continue; }
+            if (pos < s.size() && s[pos] == ']') { ++pos; break; }
+            break;
+        }
+    } else {
+        while (pos < s.size() && s[pos] != ',' && s[pos] != '}' && s[pos] != ']' &&
+               s[pos] != ' ' && s[pos] != '\t' && s[pos] != '\r' && s[pos] != '\n') {
+            ++pos;
+        }
+    }
+}
+
+static bool parseDriveFilesListResponse(
+    const std::string& json,
+    std::vector<DriveFileInfo>& outFiles,
+    std::string& outNextPageToken
+) {
+    outNextPageToken.clear();
+    size_t pos = 0;
+    jsonSkipWs(json, pos);
+    if (pos >= json.size() || json[pos] != '{') return false;
+    ++pos;
+
+    while (pos < json.size()) {
+        jsonSkipWs(json, pos);
+        if (pos < json.size() && json[pos] == '}') { ++pos; return true; }
+        std::string key;
+        if (!jsonParseStringAt(json, pos, key)) return false;
+        jsonSkipWs(json, pos);
+        if (pos >= json.size() || json[pos] != ':') return false;
+        ++pos;
+        jsonSkipWs(json, pos);
+
+        if (key == "nextPageToken") {
+            jsonParseStringAt(json, pos, outNextPageToken);
+        } else if (key == "files") {
+            if (pos < json.size() && json[pos] == '[') {
+                ++pos;
+                jsonSkipWs(json, pos);
+                while (pos < json.size() && json[pos] != ']') {
+                    jsonSkipWs(json, pos);
+                    if (pos < json.size() && json[pos] == '{') {
+                        ++pos;
+                        DriveFileInfo info;
+                        while (pos < json.size()) {
+                            jsonSkipWs(json, pos);
+                            if (pos < json.size() && json[pos] == '}') { ++pos; break; }
+                            std::string fkey;
+                            if (!jsonParseStringAt(json, pos, fkey)) break;
+                            jsonSkipWs(json, pos);
+                            if (pos < json.size() && json[pos] == ':') ++pos;
+                            jsonSkipWs(json, pos);
+                            if (fkey == "id") {
+                                jsonParseStringAt(json, pos, info.id);
+                            } else if (fkey == "name") {
+                                jsonParseStringAt(json, pos, info.name);
+                            } else if (fkey == "mimeType") {
+                                jsonParseStringAt(json, pos, info.mimeType);
+                            } else if (fkey == "parents" && pos < json.size() && json[pos] == '[') {
+                                ++pos;
+                                jsonSkipWs(json, pos);
+                                while (pos < json.size() && json[pos] != ']') {
+                                    std::string pid;
+                                    if (jsonParseStringAt(json, pos, pid)) {
+                                        info.parents.push_back(std::move(pid));
+                                    } else {
+                                        jsonSkipValue(json, pos);
+                                    }
+                                    jsonSkipWs(json, pos);
+                                    if (pos < json.size() && json[pos] == ',') ++pos;
+                                    jsonSkipWs(json, pos);
+                                }
+                                if (pos < json.size() && json[pos] == ']') ++pos;
+                            } else {
+                                jsonSkipValue(json, pos);
+                            }
+                            jsonSkipWs(json, pos);
+                            if (pos < json.size() && json[pos] == ',') ++pos;
+                        }
+                        if (!info.id.empty()) {
+                            outFiles.push_back(std::move(info));
+                        }
+                    } else {
+                        jsonSkipValue(json, pos);
+                    }
+                    jsonSkipWs(json, pos);
+                    if (pos < json.size() && json[pos] == ',') ++pos;
+                    jsonSkipWs(json, pos);
+                }
+                if (pos < json.size() && json[pos] == ']') ++pos;
+            } else {
+                jsonSkipValue(json, pos);
+            }
+        } else {
+            jsonSkipValue(json, pos);
+        }
+
+        jsonSkipWs(json, pos);
+        if (pos < json.size() && json[pos] == ',') ++pos;
+    }
+    return true;
+}
+
+static bool verifyFolderExistsAndActive(const std::string& folderId, const std::string& token) {
+    if (folderId.empty()) return false;
+    std::string path = "/drive/v3/files/" + urlEncode(folderId) + "?fields=id,trashed";
+    std::wstring authHeader = L"Authorization: Bearer " + toWide(token) + L"\r\n";
+    HttpResponse resp = httpGet(L"www.googleapis.com", toWide(path), authHeader);
+    if (!resp.networkOk || resp.statusCode != 200) return false;
+    if (resp.body.find("\"trashed\": true") != std::string::npos ||
+        resp.body.find("\"trashed\":true") != std::string::npos) {
+        return false;
+    }
+    return !jsonExtractString(resp.body, "id").empty();
+}
+
+bool cleanGoogleDrive(
+    AuthData& auth,
+    const fs::path& authFile,
+    const std::string& folderName,
+    bool assumeYes
+) {
+    std::string token;
+    if (!ensureAccessToken(auth, token)) {
+        std::cerr << "Error: Could not obtain Google Drive access token.\n";
+        return false;
+    }
+
+    // Verify saved driveFolderId actually exists and is not trashed
+    if (!auth.driveFolderId.empty() && !verifyFolderExistsAndActive(auth.driveFolderId, token)) {
+        std::lock_guard<std::mutex> lock(g_authMtx);
+        auth.driveFolderId.clear();
+    }
+
+    std::string appFolderId;
+    if (!ensureDriveFolder(auth, authFile, folderName, appFolderId) || appFolderId.empty()) {
+        std::cerr << "Error: Could not locate or create the app's Google Drive folder ('"
+                  << folderName << "'). Aborting cleanup to protect your files.\n";
+        return false;
+    }
+
+    std::cout << "Scanning Google Drive...\n";
+    std::vector<DriveFileInfo> allFiles;
+    std::string pageToken;
+    const std::string query = "'me' in owners and trashed=false";
+
+    while (true) {
+        std::string path = "/drive/v3/files?q=" + urlEncode(query) +
+                           "&fields=nextPageToken,files(id,name,mimeType,parents)&pageSize=1000";
+        if (!pageToken.empty()) {
+            path += "&pageToken=" + urlEncode(pageToken);
+        }
+        std::wstring authHeader = L"Authorization: Bearer " + toWide(token) + L"\r\n";
+        HttpResponse resp = httpGet(L"www.googleapis.com", toWide(path), authHeader);
+
+        if (resp.statusCode == 401) {
+            {
+                std::lock_guard<std::mutex> lock(g_authMtx);
+                auth.accessToken.clear();
+            }
+            if (!ensureAccessToken(auth, token)) {
+                std::cerr << "Error: Failed to refresh access token.\n";
+                return false;
+            }
+            authHeader = L"Authorization: Bearer " + toWide(token) + L"\r\n";
+            resp = httpGet(L"www.googleapis.com", toWide(path), authHeader);
+        }
+
+        if (!resp.networkOk || resp.statusCode != 200) {
+            if (resp.statusCode == 403) {
+                std::cerr << "Error (HTTP 403): Insufficient Google Drive permissions.\n"
+                          << "Please re-authenticate with full Drive access:\n"
+                          << "  snap.exe --logout\n"
+                          << "  snap.exe --login\n";
+            } else {
+                std::cerr << "Error listing Google Drive files (HTTP " << resp.statusCode << "): "
+                          << resp.body << "\n";
+            }
+            return false;
+        }
+
+        std::string nextTok;
+        if (!parseDriveFilesListResponse(resp.body, allFiles, nextTok)) {
+            std::cerr << "Error: Failed to parse Google Drive file list.\n";
+            return false;
+        }
+        if (nextTok.empty()) break;
+        pageToken = nextTok;
+    }
+
+    std::unordered_map<std::string, const DriveFileInfo*> fileMap;
+    fileMap.reserve(allFiles.size());
+    for (const auto& f : allFiles) {
+        fileMap[f.id] = &f;
+    }
+
+    // Protect appFolderId and any of its ancestor folders
+    std::unordered_set<std::string> protectedAncestors;
+    protectedAncestors.insert(appFolderId);
+    {
+        std::vector<std::string> stack{appFolderId};
+        while (!stack.empty()) {
+            std::string cur = stack.back();
+            stack.pop_back();
+            auto it = fileMap.find(cur);
+            if (it == fileMap.end()) continue;
+            for (const auto& p : it->second->parents) {
+                if (protectedAncestors.insert(p).second) {
+                    stack.push_back(p);
+                }
+            }
+        }
+    }
+
+    auto isInsideAppFolder = [&](const std::string& id) -> bool {
+        std::unordered_set<std::string> visited;
+        std::vector<std::string> stack;
+        auto it0 = fileMap.find(id);
+        if (it0 == fileMap.end()) return false;
+        for (const auto& p : it0->second->parents) stack.push_back(p);
+        while (!stack.empty()) {
+            std::string cur = stack.back();
+            stack.pop_back();
+            if (cur == appFolderId) return true;
+            if (!visited.insert(cur).second) continue;
+            auto it = fileMap.find(cur);
+            if (it != fileMap.end()) {
+                for (const auto& p : it->second->parents) stack.push_back(p);
+            }
+        }
+        return false;
+    };
+
+    std::unordered_set<std::string> toDeleteIds;
+    size_t keptImages = 0;
+    size_t keptSubfolders = 0;
+
+    for (const auto& f : allFiles) {
+        if (protectedAncestors.count(f.id)) {
+            continue;
+        }
+        if (isInsideAppFolder(f.id)) {
+            if (f.mimeType.rfind("image/", 0) == 0) {
+                ++keptImages;
+                continue;
+            }
+            if (f.mimeType == "application/vnd.google-apps.folder") {
+                ++keptSubfolders;
+                continue;
+            }
+            // Non-image file inside the app folder -> delete
+            toDeleteIds.insert(f.id);
+        } else {
+            toDeleteIds.insert(f.id);
+        }
+    }
+
+    // Only issue DELETE for top-level targets whose parents are not all already in toDeleteIds
+    std::vector<const DriveFileInfo*> deleteTargets;
+    for (const auto& f : allFiles) {
+        if (!toDeleteIds.count(f.id)) continue;
+        bool coveredByDeletedParent = false;
+        if (!f.parents.empty()) {
+            coveredByDeletedParent = true;
+            for (const auto& p : f.parents) {
+                if (!toDeleteIds.count(p)) {
+                    coveredByDeletedParent = false;
+                    break;
+                }
+            }
+        }
+        if (!coveredByDeletedParent) {
+            deleteTargets.push_back(&f);
+        }
+    }
+
+    std::cout << "\n=== Google Drive Cleanup Summary ===\n";
+    std::cout << "  Protected folder : " << folderName << " (ID: " << appFolderId << ")\n";
+    std::cout << "  Images kept      : " << keptImages << " (in " << keptSubfolders << " subfolder(s))\n";
+    std::cout << "  Items to delete  : " << toDeleteIds.size()
+              << " (" << deleteTargets.size() << " top-level file(s)/folder(s))\n";
+    std::cout << "  Trash            : Will be permanently emptied\n\n";
+
+    if (!assumeYes) {
+        std::cout << "WARNING: This will PERMANENTLY delete everything in Google Drive\n"
+                  << "outside '" << folderName << "' (and empty Trash). This cannot be undone!\n"
+                  << "Type YES to confirm: ";
+        std::string confirm;
+        std::getline(std::cin, confirm);
+        if (confirm != "YES" && confirm != "yes") {
+            std::cout << "Cleanup cancelled.\n";
+            return false;
+        }
+    }
+
+    size_t deletedCount = 0;
+    size_t failedCount = 0;
+    bool scopeError = false;
+
+    for (size_t i = 0; i < deleteTargets.size(); ++i) {
+        const DriveFileInfo* item = deleteTargets[i];
+        std::string delPath = "/drive/v3/files/" + urlEncode(item->id);
+        std::wstring authHeader = L"Authorization: Bearer " + toWide(token) + L"\r\n";
+        HttpResponse resp = httpDelete(L"www.googleapis.com", toWide(delPath), authHeader);
+
+        if (resp.statusCode == 401) {
+            {
+                std::lock_guard<std::mutex> lock(g_authMtx);
+                auth.accessToken.clear();
+            }
+            if (ensureAccessToken(auth, token)) {
+                authHeader = L"Authorization: Bearer " + toWide(token) + L"\r\n";
+                resp = httpDelete(L"www.googleapis.com", toWide(delPath), authHeader);
+            }
+        }
+
+        if (resp.networkOk && (resp.statusCode == 200 || resp.statusCode == 204 || resp.statusCode == 404)) {
+            ++deletedCount;
+            std::cout << "[" << (i + 1) << "/" << deleteTargets.size() << "] Deleted: " << item->name << "\n";
+        } else {
+            ++failedCount;
+            if (resp.statusCode == 403) {
+                scopeError = true;
+            }
+            std::cerr << "[" << (i + 1) << "/" << deleteTargets.size() << "] Failed to delete '"
+                      << item->name << "' (HTTP " << resp.statusCode << ")\n";
+        }
+    }
+
+    // Empty Google Drive Trash permanently
+    std::cout << "Emptying Google Drive Trash...\n";
+    std::wstring trashAuthHeader = L"Authorization: Bearer " + toWide(token) + L"\r\n";
+    HttpResponse trashResp = httpDelete(L"www.googleapis.com", L"/drive/v3/files/trash", trashAuthHeader);
+    if (trashResp.statusCode == 401) {
+        {
+            std::lock_guard<std::mutex> lock(g_authMtx);
+            auth.accessToken.clear();
+        }
+        if (ensureAccessToken(auth, token)) {
+            trashAuthHeader = L"Authorization: Bearer " + toWide(token) + L"\r\n";
+            trashResp = httpDelete(L"www.googleapis.com", L"/drive/v3/files/trash", trashAuthHeader);
+        }
+    }
+
+    bool trashOk = trashResp.networkOk && (trashResp.statusCode == 200 || trashResp.statusCode == 204);
+    if (trashOk) {
+        std::cout << "Trash emptied permanently.\n";
+    } else {
+        if (trashResp.statusCode == 403) scopeError = true;
+        std::cerr << "Warning: Could not empty Trash (HTTP " << trashResp.statusCode << ").\n";
+    }
+
+    if (scopeError) {
+        std::cerr << "\nNote: Some operations returned HTTP 403 (insufficient permissions).\n"
+                  << "Run `snap.exe --logout` then `snap.exe --login` to grant full Drive access.\n";
+    }
+
+    std::cout << "\nCleanup complete. Deleted: " << deletedCount
+              << ", Failed: " << failedCount
+              << ", Kept images: " << keptImages << ".\n";
+    return (failedCount == 0 && trashOk);
 }
 
 // MARK: - Windows Startup Registry Helpers
@@ -1939,6 +2397,17 @@ int main(int argc, char* argv[]) {
         if (!opts.driveFolderId.empty()) {
             auth.driveFolderId = opts.driveFolderId;
         }
+    }
+
+    if (opts.cleanDrive) {
+        if (opts.localOnly) {
+            std::cerr << "Error: --clean-drive cannot be used with --local.\n";
+            CoUninitialize();
+            return 1;
+        }
+        bool ok = cleanGoogleDrive(auth, authFile, opts.driveFolderName, opts.assumeYes);
+        CoUninitialize();
+        return ok ? 0 : 1;
     }
 
     if (opts.installStartup) {
